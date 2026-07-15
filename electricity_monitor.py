@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from http.cookies import SimpleCookie
 import argparse
 import json
 import logging
@@ -54,6 +54,21 @@ def env_int(name: str, default: int, *, minimum: int = 0) -> int:
         raise ElectricityMonitorError(f"环境变量 {name} 不能小于 {minimum}")
     return value
 
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+
+    if not raw:
+        return default
+
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+
+    if raw in {"0", "false", "no", "off"}:
+        return False
+
+    raise ElectricityMonitorError(
+        f"环境变量 {name} 必须是 true/false，当前值为 {raw!r}"
+    )
 
 def env_decimal(name: str, default: str) -> Decimal:
     raw = os.getenv(name, "").strip() or default
@@ -126,14 +141,28 @@ def child_text(element: ET.Element, name: str) -> str | None:
             return (child.text or "").strip()
     return None
 
+def is_verification_page(text: str) -> bool:
+    lowered = text.lower()
+
+    return (
+        "真人检测" in text
+        or "自动检测请求" in text
+        or "detect-human" in lowered
+        or "/wengine/auth/" in lowered
+    )
 
 def parse_electricity_xml(xml_text: str) -> list[ElectricityRecord]:
     stripped = xml_text.lstrip()
     lowered = stripped[:1000].lower()
 
-    if "<html" in lowered or "真人检测" in stripped or "detect-human" in lowered:
+    if is_verification_page(stripped):
         raise VerificationRequiredError(
-            "接口返回了真人检测页面。GUET_ELECTRICITY_COOKIE 可能已失效，需要从 Reqable 更新。"
+            "接口返回了真人检测页面，需要刷新浏览器会话。"
+        )
+
+    if "<html" in lowered:
+        raise InvalidResponseError(
+            "接口返回了 HTML 页面，而不是预期的电量 XML。"
         )
 
     try:
@@ -173,63 +202,154 @@ def latest_record(records: Iterable[ElectricityRecord]) -> ElectricityRecord:
         raise InvalidResponseError("没有可用电量记录")
     return max(items, key=lambda item: item.recorded_at)
 
+def parse_cookie_header(cookie_header: str) -> dict[str, str]:
+    """把 .env 中的 Cookie 请求头解析成字典。"""
+    if not cookie_header.strip():
+        return {}
+
+    parsed = SimpleCookie()
+    parsed.load(cookie_header)
+
+    return {
+        name: morsel.value
+        for name, morsel in parsed.items()
+    }
+
+
+def load_saved_browser_cookies(path: Path) -> dict[str, str]:
+    """读取 Playwright 刷新后保存的 Cookie。"""
+    if not path.exists():
+        return {}
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        LOGGER.warning("浏览器 Cookie 文件读取失败：%s", exc)
+        return {}
+
+    if not isinstance(data, list):
+        return {}
+
+    result: dict[str, str] = {}
+
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+
+        name = str(item.get("name", "")).strip()
+        value = str(item.get("value", "")).strip()
+        domain = str(item.get("domain", "")).lstrip(".").lower()
+
+        if not name or not value:
+            continue
+
+        if domain == "sdcx.guet.edu.cn" or domain.endswith(
+            ".sdcx.guet.edu.cn"
+        ):
+            result[name] = value
+
+    return result
+
+
+def get_effective_cookie_header() -> str:
+    """
+    合并 .env 中的初始 Cookie 和浏览器最近保存的 Cookie。
+
+    浏览器刷新得到的 Cookie 优先级更高。
+    """
+    cookie_file = resolve_local_path(
+        "GUET_COOKIE_FILE",
+        "./data/guet-cookies.json",
+    )
+
+    cookies = parse_cookie_header(
+        os.getenv("GUET_ELECTRICITY_COOKIE", "")
+    )
+    cookies.update(load_saved_browser_cookies(cookie_file))
+
+    return "; ".join(
+        f"{name}={value}"
+        for name, value in cookies.items()
+    )
+
+
+def save_browser_cookies(
+    path: Path,
+    cookies: list[dict],
+) -> None:
+    """保存浏览器会话 Cookie，供后续 requests 查询使用。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(
+        json.dumps(cookies, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temp_path.replace(path)
 
 def build_session(cookie: str) -> requests.Session:
     session = requests.Session()
-    session.headers.update(
-        {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0"
-            ),
-            "Accept": "*/*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
-            "Accept-Encoding": "gzip, deflate",
-            "Referer": "http://sdcx.guet.edu.cn/yd",
-            "Pragma": "no-cache",
-            "Cache-Control": "no-cache",
-            "Cookie": cookie,
-        }
-    )
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0"
+        ),
+        "Accept": "*/*",
+        "Accept-Language": (
+            "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6"
+        ),
+        "Accept-Encoding": "gzip, deflate",
+        "Referer": "http://sdcx.guet.edu.cn/yd",
+        "Pragma": "no-cache",
+        "Cache-Control": "no-cache",
+    }
+
+    if cookie:
+        headers["Cookie"] = cookie
+
+    session.headers.update(headers)
     return session
 
 
-def fetch_latest_record() -> ElectricityRecord:
-    base_url = os.getenv("GUET_BASE_URL", "http://sdcx.guet.edu.cn").strip().rstrip("/")
-    room_no = os.getenv("GUET_ROOM_NO", "y503616").strip()
-    query_count = env_int("GUET_QUERY_COUNT", 10, minimum=1)
-    timeout = env_int("GUET_REQUEST_TIMEOUT", 20, minimum=1)
-    retries = env_int("GUET_REQUEST_RETRIES", 3, minimum=1)
-    cookie = os.getenv("GUET_ELECTRICITY_COOKIE", "").strip()
-
-    if not room_no:
-        raise ElectricityMonitorError("GUET_ROOM_NO 不能为空")
-    if not cookie:
-        raise ElectricityMonitorError("未设置 GUET_ELECTRICITY_COOKIE")
-
-    endpoint = (
-        f"{base_url}/yktserver/ecardserv/ykt.asmx/GetYDLSByRoomno"
-    )
+def fetch_latest_record_with_requests(
+    endpoint: str,
+    room_no: str,
+    query_count: int,
+    timeout: int,
+    retries: int,
+    cookie: str,
+) -> ElectricityRecord:
+    """优先使用轻量的 requests 查询电量。"""
     session = build_session(cookie)
-
     last_error: Exception | None = None
+
     for attempt in range(1, retries + 1):
         try:
             response = session.get(
                 endpoint,
-                params={"roomno": room_no, "n": query_count},
+                params={
+                    "roomno": room_no,
+                    "n": query_count,
+                },
                 timeout=timeout,
             )
             response.raise_for_status()
+
             records = parse_electricity_xml(response.text)
             return latest_record(records)
+
         except VerificationRequiredError:
+            # 真人检测不是普通网络错误，无需重复发送相同请求。
             raise
+
         except (requests.RequestException, InvalidResponseError) as exc:
             last_error = exc
+
             if attempt < retries:
                 wait_seconds = min(5 * attempt, 15)
+
                 LOGGER.warning(
                     "第 %s/%s 次请求失败：%s；%s 秒后重试",
                     attempt,
@@ -240,7 +360,259 @@ def fetch_latest_record() -> ElectricityRecord:
                 time.sleep(wait_seconds)
 
     raise ElectricityMonitorError(
-        f"请求在 {retries} 次尝试后仍失败：{last_error}"
+        f"requests 查询在 {retries} 次尝试后仍失败：{last_error}"
+    )
+
+
+def wait_for_browser_verification(
+    page,
+    wait_seconds: int,
+) -> None:
+    """
+    等待网站正常完成真人检测。
+
+    如果页面出现需要人工操作的验证，可在打开的 Edge 窗口中完成。
+    """
+    deadline = time.monotonic() + wait_seconds
+
+    while time.monotonic() < deadline:
+        try:
+            body_text = page.locator("body").inner_text(timeout=3000)
+        except Exception:
+            body_text = ""
+
+        current_url = page.url.lower()
+
+        verification_active = (
+            is_verification_page(body_text)
+            or "/wengine/auth/" in current_url
+        )
+
+        if body_text and not verification_active:
+            return
+
+        page.wait_for_timeout(1000)
+
+    raise VerificationRequiredError(
+        f"浏览器真人检测在 {wait_seconds} 秒内未完成。"
+        "请在打开的 Chrome 窗口中手动完成验证，"
+        "或适当增大 GUET_VERIFICATION_WAIT_SECONDS。"
+    )
+
+
+def fetch_latest_record_with_browser(
+    base_url: str,
+    endpoint: str,
+    room_no: str,
+    query_count: int,
+    timeout: int,
+) -> ElectricityRecord:
+    """Cookie 失效时，通过持久化 Chrome 会话刷新验证状态。"""
+    try:
+        from playwright.sync_api import (
+            Error as PlaywrightError,
+            TimeoutError as PlaywrightTimeoutError,
+            sync_playwright,
+        )
+    except ImportError as exc:
+        raise ElectricityMonitorError(
+            "未安装 Playwright，请执行："
+            "python -m pip install playwright"
+        ) from exc
+
+    profile_dir = resolve_local_path(
+        "GUET_BROWSER_PROFILE_DIR",
+        "./data/guet-browser-profile",
+    )
+    cookie_file = resolve_local_path(
+        "GUET_COOKIE_FILE",
+        "./data/guet-cookies.json",
+    )
+
+    browser_channel = os.getenv(
+        "GUET_BROWSER_CHANNEL",
+        "chrome",
+    ).strip()
+
+    headless = env_bool(
+        "GUET_BROWSER_HEADLESS",
+        False,
+    )
+
+    verification_wait = env_int(
+        "GUET_VERIFICATION_WAIT_SECONDS",
+        90,
+        minimum=10,
+    )
+
+    profile_dir.mkdir(parents=True, exist_ok=True)
+
+    LOGGER.warning(
+        "Cookie 已失效，正在启动 Chrome 刷新会话。"
+        "如出现交互验证，请在浏览器窗口中完成。"
+    )
+
+    try:
+        with sync_playwright() as playwright:
+            launch_options = {
+                "user_data_dir": str(profile_dir),
+                "headless": headless,
+            }
+
+            if browser_channel:
+                launch_options["channel"] = browser_channel
+
+            context = playwright.chromium.launch_persistent_context(
+                **launch_options
+            )
+
+            try:
+                page = (
+                    context.pages[0]
+                    if context.pages
+                    else context.new_page()
+                )
+
+                page.bring_to_front()
+                page.goto(
+                    f"{base_url}/yd",
+                    wait_until="domcontentloaded",
+                    timeout=timeout * 1000,
+                )
+
+                wait_for_browser_verification(
+                    page,
+                    verification_wait,
+                )
+
+                # BrowserContext 自带的 APIRequestContext 与浏览器共享 Cookie。
+                api_response = context.request.get(
+                    endpoint,
+                    params={
+                        "roomno": room_no,
+                        "n": query_count,
+                    },
+                    headers={
+                        "Accept": "*/*",
+                        "Referer": f"{base_url}/yd",
+                        "Cache-Control": "no-cache",
+                    },
+                    timeout=timeout * 1000,
+                )
+
+                if not api_response.ok:
+                    raise ElectricityMonitorError(
+                        "浏览器会话请求电量接口失败："
+                        f"HTTP {api_response.status}"
+                    )
+
+                response_text = api_response.text()
+
+                # 保存最新 Cookie。以后优先用 requests，不必每次打开浏览器。
+                browser_cookies = context.cookies()
+                save_browser_cookies(
+                    cookie_file,
+                    browser_cookies,
+                )
+
+                records = parse_electricity_xml(response_text)
+                record = latest_record(records)
+
+                LOGGER.info(
+                    "浏览器会话刷新成功，新的 Cookie 已保存"
+                )
+                return record
+
+            finally:
+                context.close()
+
+    except PlaywrightTimeoutError as exc:
+        raise ElectricityMonitorError(
+            f"浏览器访问校园电量页面超时：{exc}"
+        ) from exc
+
+    except PlaywrightError as exc:
+        raise ElectricityMonitorError(
+            f"浏览器自动化执行失败：{exc}"
+        ) from exc
+
+
+def fetch_latest_record() -> ElectricityRecord:
+    """
+    混合查询方案：
+
+    1. 优先使用 requests + 已保存 Cookie；
+    2. 返回真人检测页面时启动 Edge；
+    3. 浏览器正常完成检测并保存新 Cookie；
+    4. 后续运行重新使用 requests。
+    """
+    base_url = os.getenv(
+        "GUET_BASE_URL",
+        "http://sdcx.guet.edu.cn",
+    ).strip().rstrip("/")
+
+    room_no = os.getenv(
+        "GUET_ROOM_NO",
+        "y503616",
+    ).strip()
+
+    query_count = env_int(
+        "GUET_QUERY_COUNT",
+        10,
+        minimum=1,
+    )
+
+    timeout = env_int(
+        "GUET_REQUEST_TIMEOUT",
+        20,
+        minimum=1,
+    )
+
+    retries = env_int(
+        "GUET_REQUEST_RETRIES",
+        3,
+        minimum=1,
+    )
+
+    if not room_no:
+        raise ElectricityMonitorError(
+            "GUET_ROOM_NO 不能为空"
+        )
+
+    endpoint = (
+        f"{base_url}/yktserver/ecardserv/"
+        "ykt.asmx/GetYDLSByRoomno"
+    )
+
+    cookie_header = get_effective_cookie_header()
+
+    if cookie_header:
+        try:
+            return fetch_latest_record_with_requests(
+                endpoint=endpoint,
+                room_no=room_no,
+                query_count=query_count,
+                timeout=timeout,
+                retries=retries,
+                cookie=cookie_header,
+            )
+
+        except VerificationRequiredError:
+            LOGGER.warning(
+                "requests 使用的 Cookie 已失效，"
+                "切换到浏览器会话刷新模式"
+            )
+    else:
+        LOGGER.warning(
+            "未找到可用 Cookie，直接启动浏览器会话"
+        )
+
+    return fetch_latest_record_with_browser(
+        base_url=base_url,
+        endpoint=endpoint,
+        room_no=room_no,
+        query_count=query_count,
+        timeout=timeout,
     )
 
 
