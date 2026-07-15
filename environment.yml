@@ -1,0 +1,9 @@
+name: electricity-monitor
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - requests>=2.32,<3
+      - python-dotenv>=1.0,<2
