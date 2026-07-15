@@ -271,26 +271,31 @@ def write_state(path: Path, state: dict) -> None:
     temp_path.replace(path)
 
 
-def gmail_configured() -> bool:
-    required = ("GMAIL_USERNAME", "GMAIL_APP_PASSWORD", "ALERT_TO_EMAIL")
+FIXED_MAIL_SUBJECT = "[宿舍电量监控] 低电量提醒"
+
+
+def qq_mail_configured() -> bool:
+    required = ("QQ_EMAIL", "QQ_AUTH_CODE", "ALERT_TO_EMAIL")
     return all(os.getenv(name, "").strip() for name in required)
 
 
 def send_low_power_email(record: ElectricityRecord, threshold: Decimal) -> None:
-    username = os.getenv("GMAIL_USERNAME", "").strip()
-    app_password = os.getenv("GMAIL_APP_PASSWORD", "").strip()
+    username = os.getenv("QQ_EMAIL", "").strip()
+    auth_code = os.getenv("QQ_AUTH_CODE", "").strip()
     recipient = os.getenv("ALERT_TO_EMAIL", "").strip()
-    smtp_host = os.getenv("GMAIL_SMTP_HOST", "smtp.gmail.com").strip()
-    smtp_port = env_int("GMAIL_SMTP_PORT", 465, minimum=1)
+    smtp_host = os.getenv("QQ_SMTP_HOST", "smtp.qq.com").strip()
+    smtp_port = env_int("QQ_SMTP_PORT", 465, minimum=1)
+    smtp_timeout = env_int("QQ_SMTP_TIMEOUT", 30, minimum=1)
     room_no = os.getenv("GUET_ROOM_NO", "y503616").strip()
 
-    if not gmail_configured():
+    if not qq_mail_configured():
         raise ElectricityMonitorError(
-            "邮件提醒未配置完整：请设置 GMAIL_USERNAME、GMAIL_APP_PASSWORD 和 ALERT_TO_EMAIL"
+            "邮件提醒未配置完整：请设置 QQ_EMAIL、QQ_AUTH_CODE 和 ALERT_TO_EMAIL"
         )
 
     message = EmailMessage()
-    message["Subject"] = f"宿舍剩余电量不足：{record.remain}"
+    # 主题保持完全固定，便于在 QQ 邮箱中按主题创建过滤规则。
+    message["Subject"] = FIXED_MAIL_SUBJECT
     message["From"] = username
     message["To"] = recipient
     message.set_content(
@@ -309,9 +314,12 @@ def send_low_power_email(record: ElectricityRecord, threshold: Decimal) -> None:
         )
     )
 
-    with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30) as smtp:
-        smtp.login(username, app_password)
-        smtp.send_message(message)
+    try:
+        with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=smtp_timeout) as smtp:
+            smtp.login(username, auth_code)
+            smtp.send_message(message)
+    except (OSError, smtplib.SMTPException) as exc:
+        raise ElectricityMonitorError(f"QQ 邮箱发送失败：{exc}") from exc
 
 
 def run(*, check_only: bool, force: bool) -> int:
@@ -362,14 +370,14 @@ def run(*, check_only: bool, force: bool) -> int:
     if record.remain < threshold:
         if already_alerted:
             LOGGER.info("电量仍低于阈值，但此前已提醒，本次不重复发送邮件")
-        elif gmail_configured():
+        elif qq_mail_configured():
             send_low_power_email(record, threshold)
             state["low_power_alerted"] = True
             state["last_alert_at"] = datetime.now().isoformat(timespec="seconds")
             LOGGER.warning("电量低于阈值，提醒邮件已发送")
         else:
             LOGGER.warning(
-                "电量低于阈值，但 Gmail 未配置完整；未发送邮件，也不会标记为已提醒"
+                "电量低于阈值，但 QQ 邮箱未配置完整；未发送邮件，也不会标记为已提醒"
             )
     else:
         if already_alerted:
@@ -420,11 +428,29 @@ def main() -> int:
         action="store_true",
         help="仅运行 XML 解析自检，不访问网络",
     )
+    parser.add_argument(
+        "--test-email",
+        action="store_true",
+        help="发送一封 QQ 邮箱测试邮件，不查询电量、不修改状态",
+    )
     args = parser.parse_args()
 
     try:
         if args.self_test:
             return self_test()
+        if args.test_email:
+            now = datetime.now()
+            record = ElectricityRecord(
+                recorded_at=now,
+                recorded_at_raw=now.strftime("%Y-%m-%d %H:%M:%S"),
+                remain=Decimal("19.90"),
+            )
+            send_low_power_email(
+                record,
+                env_decimal("GUET_ELECTRICITY_THRESHOLD", "20"),
+            )
+            print(f"QQ 邮箱测试邮件已发送，固定主题：{FIXED_MAIL_SUBJECT}")
+            return 0
         return run(check_only=args.check_only, force=args.force)
     except VerificationRequiredError as exc:
         LOGGER.error("%s", exc)
