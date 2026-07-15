@@ -364,39 +364,86 @@ def fetch_latest_record_with_requests(
     )
 
 
-def wait_for_browser_verification(
+def page_requires_verification(page) -> bool:
+    """判断当前页面是否仍处于真人检测状态。"""
+    try:
+        body_text = page.locator("body").inner_text(timeout=3000)
+    except Exception:
+        body_text = ""
+
+    current_url = page.url.lower()
+
+    return (
+        is_verification_page(body_text)
+        or "/wengine/auth/" in current_url
+    )
+
+
+def complete_browser_verification(
     page,
+    base_url: str,
     wait_seconds: int,
+    navigation_timeout_ms: int,
+    reload_delay_seconds: int,
 ) -> None:
     """
-    等待网站正常完成真人检测。
+    在隐藏的 Chrome 中完成验证。
 
-    如果页面出现需要人工操作的验证，可在打开的 Edge 窗口中完成。
+    真人检测脚本执行后，网站不一定会可靠地自动跳回 /yd，
+    因此程序会等待检测脚本写入 Cookie，然后主动重新访问 /yd。
     """
+    target_url = f"{base_url}/yd"
     deadline = time.monotonic() + wait_seconds
+    attempt = 0
+
+    page.goto(
+        target_url,
+        wait_until="domcontentloaded",
+        timeout=navigation_timeout_ms,
+    )
 
     while time.monotonic() < deadline:
-        try:
-            body_text = page.locator("body").inner_text(timeout=3000)
-        except Exception:
-            body_text = ""
+        attempt += 1
 
-        current_url = page.url.lower()
+        if not page_requires_verification(page):
+            # 即使已经离开检测页，也显式回到目标页面，
+            # 确保后续接口请求使用完整验证后的会话。
+            if page.url.rstrip("/").lower() != target_url.rstrip("/").lower():
+                page.goto(
+                    target_url,
+                    wait_until="domcontentloaded",
+                    timeout=navigation_timeout_ms,
+                )
 
-        verification_active = (
-            is_verification_page(body_text)
-            or "/wengine/auth/" in current_url
+            if not page_requires_verification(page):
+                LOGGER.info(
+                    "浏览器验证完成，当前页面已重定向到 %s",
+                    target_url,
+                )
+                return
+
+        LOGGER.info(
+            "真人检测尚未完成，第 %s 次等待；%s 秒后重新访问 %s",
+            attempt,
+            reload_delay_seconds,
+            target_url,
         )
 
-        if body_text and not verification_active:
-            return
+        # 让 detect-human.js 有足够时间执行并写入验证 Cookie。
+        page.wait_for_timeout(reload_delay_seconds * 1000)
+
+        # 网站有时不会自动跳转，因此主动重新进入 /yd。
+        page.goto(
+            target_url,
+            wait_until="domcontentloaded",
+            timeout=navigation_timeout_ms,
+        )
 
         page.wait_for_timeout(1000)
 
     raise VerificationRequiredError(
-        f"浏览器真人检测在 {wait_seconds} 秒内未完成。"
-        "请在打开的 Chrome 窗口中手动完成验证，"
-        "或适当增大 GUET_VERIFICATION_WAIT_SECONDS。"
+        f"隐藏浏览器在 {wait_seconds} 秒内未能完成真人检测。"
+        "网站可能启用了必须人工操作的交互验证。"
     )
 
 
@@ -436,7 +483,7 @@ def fetch_latest_record_with_browser(
 
     headless = env_bool(
         "GUET_BROWSER_HEADLESS",
-        False,
+        True,
     )
 
     verification_wait = env_int(
@@ -445,11 +492,16 @@ def fetch_latest_record_with_browser(
         minimum=10,
     )
 
+    reload_delay_seconds = env_int(
+        "GUET_VERIFICATION_RELOAD_DELAY_SECONDS",
+        7,
+        minimum=5,
+    )
+
     profile_dir.mkdir(parents=True, exist_ok=True)
 
     LOGGER.warning(
-        "Cookie 已失效，正在启动 Chrome 刷新会话。"
-        "如出现交互验证，请在浏览器窗口中完成。"
+        "Cookie 已失效，正在启动隐藏的 Chrome 刷新会话。"
     )
 
     try:
@@ -473,16 +525,12 @@ def fetch_latest_record_with_browser(
                     else context.new_page()
                 )
 
-                page.bring_to_front()
-                page.goto(
-                    f"{base_url}/yd",
-                    wait_until="domcontentloaded",
-                    timeout=timeout * 1000,
-                )
-
-                wait_for_browser_verification(
-                    page,
-                    verification_wait,
+                complete_browser_verification(
+                    page=page,
+                    base_url=base_url,
+                    wait_seconds=verification_wait,
+                    navigation_timeout_ms=timeout * 1000,
+                    reload_delay_seconds=reload_delay_seconds,
                 )
 
                 # BrowserContext 自带的 APIRequestContext 与浏览器共享 Cookie。
