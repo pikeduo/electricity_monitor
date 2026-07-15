@@ -12,7 +12,7 @@
 
 ## 功能
 
-- 查询桂电宿舍最新剩余电量；
+- 查询宿舍最新剩余电量；
 - 解析 ASP.NET DataTable XML；
 - 优先使用 `requests + Cookie` 查询；
 - Cookie 失效时自动启动本机 Google Chrome 完成人机验证；
